@@ -26,12 +26,13 @@ import org.apache.spark.sql.DataFrame
 
 import java.time.Duration
 import java.util.Optional
+import org.joda.time.LocalDateTime
 
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
 
 import com.amazonaws.services.s3.{AmazonS3Client, AmazonS3, AmazonS3ClientBuilder}
-import com.amazonaws.services.s3.model.ObjectMetadata
+import com.amazonaws.services.s3.model.{ObjectMetadata, DeleteObjectsRequest, ObjectListing, S3ObjectSummary}
 import com.amazonaws.services.s3.model.S3Object
 import com.amazonaws.services.s3.model.S3ObjectInputStream
 import com.amazonaws.ClientConfiguration
@@ -48,12 +49,17 @@ import io.github.resilience4j.core.IntervalFunction
 
 import scala.util.{Try, Success, Failure}
 import scala.collection.mutable.StringBuilder
+import scala.io.Source
 
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
+import org.json4s.jackson.Serialization
+import org.json4s.jackson.Serialization.write
 
 import java.util.Base64
 import java.nio.charset.StandardCharsets
+
+import net.jpountz.lz4.{LZ4Factory, LZ4Compressor}
 
 class LargeObjectException(s: String) extends RuntimeException {
   println(s)
@@ -66,6 +72,16 @@ class ProcessTypeException(s: String) extends RuntimeException {
 class CassandraTypeException(s: String) extends RuntimeException {
   println(s)
 }
+
+class StatsS3Exception(s: String) extends RuntimeException {
+  println(s)
+}
+
+sealed trait Stats
+
+case class DiscoveryStats(tile: Int, primaryKeys: Long, updatedTimestamp: String) extends Stats
+
+case class ReplicationStats(tile: Int, primaryKeys: Long, updatedPrimaryKeys: Long, insertedPrimaryKeys: Long, deletedPrimaryKeys: Long, updatedTimestamp: String) extends Stats
 
 class SupportFunctions() {
   def correctEmptyBinJsonValues(cols: List[String], input: String): String = {
@@ -96,6 +112,24 @@ class SupportFunctions() {
 
 object GlueApp {
   def main(sysArgs: Array[String]) {
+
+    def readReplicationStatsObject(s3Client: com.amazonaws.services.s3.AmazonS3, bucket: String, key: String): ReplicationStats = {
+      Try {
+        val s3Object = s3Client.getObject(bucket, key)
+        val src = Source.fromInputStream(s3Object.getObjectContent())
+        val json = src.getLines.mkString
+        src.close()
+        json
+      } match {
+        case Failure(_) => {
+          ReplicationStats(0, 0, 0, 0, 0, LocalDateTime.now().toString)
+        }
+        case Success(json) => {
+          implicit val formats = DefaultFormats
+          parse(json).extract[ReplicationStats]
+        }
+      }
+    }
 
     def shuffleDf(df: DataFrame): DataFrame = {
       val encoder = RowEncoder(df.schema)
@@ -194,11 +228,6 @@ object GlueApp {
       }
     }
 
-    // Cooldown period
-    val WAIT_TIME = 30000
-    val MAX_RETRY_ATTEMPTS = 256
-    // Unit ms
-    val EXP_BACKOFF = 25
     val sparkContext: SparkContext = new SparkContext()
     val glueContext: GlueContext = new GlueContext(sparkContext)
     val sparkSession: SparkSession = glueContext.getSparkSession
@@ -206,12 +235,24 @@ object GlueApp {
     val logger = new GlueLogger
     import sparkSession.implicits._
 
-    val args = GlueArgParser.getResolvedOptions(sysArgs, Seq("JOB_NAME", "TILE", "TOTAL_TILES", "PROCESS_TYPE", "SOURCE_KS", "SOURCE_TBL", "TARGET_KS", "TARGET_TBL", "WRITETIME_COLUMN", "TTL_COLUMN", "S3_LANDING_ZONE", "OFFLOAD_LARGE_OBJECTS", "REPLICATION_POINT_IN_TIME").toArray)
+    val args = GlueArgParser.getResolvedOptions(sysArgs, Seq("JOB_NAME", "TILE", "TOTAL_TILES", "PROCESS_TYPE", "SOURCE_KS", "SOURCE_TBL", "TARGET_KS", "TARGET_TBL", "WRITETIME_COLUMN", "TTL_COLUMN", "S3_LANDING_ZONE", "OFFLOAD_LARGE_OBJECTS", "REPLICATION_POINT_IN_TIME", "SAFE_MODE").toArray)
     Job.init(args("JOB_NAME"), glueContext, args.asJava)
     val jobRunId = args("JOB_RUN_ID")
     val currentTile = args("TILE").toInt
     val totalTiles = args("TOTAL_TILES").toInt
+    val safeMode = args("SAFE_MODE")
     // Internal configuration
+    val WAIT_TIME = safeMode match {
+      case "true" => 25000
+      case _ => 0
+    }
+    val cachingMode = safeMode match {
+      case "true" => StorageLevel.DISK_ONLY
+      case _ => StorageLevel.MEMORY_AND_DISK_SER
+    }
+    val MAX_RETRY_ATTEMPTS = 256
+    // Unit ms
+    val EXP_BACKOFF = 25
     sparkSession.conf.set(s"spark.sql.catalog.ledgerCatalog", "com.datastax.spark.connector.datasource.CassandraCatalog")
     sparkSession.conf.set(s"spark.sql.catalog.sourceCluster", "com.datastax.spark.connector.datasource.CassandraCatalog")
     sparkSession.conf.set(s"spark.sql.catalog.ledgerCatalog.spark.cassandra.connection.config.profile.path", "KeyspacesConnector.conf")
@@ -238,7 +279,6 @@ object GlueApp {
     val ttlColumn = args("TTL_COLUMN")
     val olo = args("OFFLOAD_LARGE_OBJECTS")
     val replicationPointInTime = args("REPLICATION_POINT_IN_TIME").toLong
-
     val defaultPartitions = scala.math.max(2, (sparkContext.defaultParallelism / 2 - 2))
 
     //AmazonS3Client to check if a stop request was issued
@@ -277,6 +317,17 @@ object GlueApp {
     val allColumnsFromSource = getAllColumns(cassandraConn, srcKeyspaceName, srcTableName)
     val blobColumns: List[String] = allColumnsFromSource.flatMap(_.filter(_._2 == "BLOB").keys).toList
 
+    def compressWithLZ4(input: String): String = {
+      val lz4Factory = LZ4Factory.fastestInstance()
+      val compressor: LZ4Compressor = lz4Factory.fastCompressor()
+      val inputBytes = input.getBytes("UTF-8")
+      val maxCompressedLength: Int = compressor.maxCompressedLength(inputBytes.length)
+      val compressedOutput = new Array[Byte](maxCompressedLength)
+      val compressedLength: Int = compressor.compress(inputBytes, 0, inputBytes.length, compressedOutput, 0, maxCompressedLength)
+      val compressedBytes = compressedOutput.slice(0, compressedLength)
+      Base64.getEncoder.encodeToString(compressedBytes)
+    }
+
     def stopRequested(bucket: String): Boolean = {
       val key = processType match {
         case "discovery" => s"$srcKeyspaceName/$srcTableName/$processType/stopRequested"
@@ -309,7 +360,7 @@ object GlueApp {
       val prefix = removeLeadingEndingSlashes((offloadLargeObjects \ "prefix").values.toString)
       val xrefColumnName = (offloadLargeObjects \ "xref").values.toString
       val key = java.util.UUID.randomUUID.toString
-      val largeObject = (jPayload \ columnName).values.toString
+      val largeObject = compressWithLZ4((jPayload \ columnName).values.toString)
       val jsonStatement = jPayload transformField {
         // Replaced s"s3://$bucket/$prefix/$key" by s"$key"
         case JField(`xrefColumnName`, _) => JField(xrefColumnName, org.json4s.JsonAST.JString(s"$key"))
@@ -328,8 +379,32 @@ object GlueApp {
       }
     }
 
-    def putStats(bucket: String, key: String, metric: String, value: String): Unit = {
-      s3client.putObject(bucket, s"$key/$metric", value)
+    def putStats(bucket: String, key: String, objectName: String, stats: Stats): Unit = {
+      implicit val formats = DefaultFormats
+      val (newContent, message) = stats match {
+        case ds: DiscoveryStats =>
+          (write(ds), s"Flushing the discovery stats: $key/$objectName")
+        case rs: ReplicationStats =>
+          val content = readReplicationStatsObject(s3client, bucket, s"$key/$objectName")
+          val insertedAggr = content.insertedPrimaryKeys + rs.insertedPrimaryKeys
+          val updatedAggr = content.updatedPrimaryKeys + rs.updatedPrimaryKeys
+          val deletedAggr = content.deletedPrimaryKeys + rs.deletedPrimaryKeys
+          val historicallyInserted = content.primaryKeys + rs.primaryKeys
+          (write(ReplicationStats(currentTile,
+            historicallyInserted,
+            updatedAggr,
+            insertedAggr,
+            deletedAggr,
+            LocalDateTime.now().toString)),
+            s"Flushing the replication stats: $key/$objectName")
+        case _ => throw new StatsS3Exception("Unknown stats type")
+      }
+      Try {
+        s3client.putObject(bucket, s"$key/$objectName", newContent)
+      } match {
+        case Failure(_) => throw new StatsS3Exception(s"Can't persist the stats to the S3 bucket $bucket")
+        case Success(_) => logger.info(message)
+      }
     }
 
     def getTTLvalue(jvalue: org.json4s.JValue): BigInt = {
@@ -502,9 +577,9 @@ object GlueApp {
 
                 persistToTarget(shuffleDfV2(sourceDfV2), columns, columnsPos, tile, "insert")
                 session.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,ver,load_status,dt_load, offload_status) VALUES('$srcKeyspaceName','$srcTableName',$tile,'head','SUCCESS', toTimestamp(now()), '')")
-
                 val cnt = sourceDfV2.count()
-                val content = s"""{"tile":$tile, "primaryKeys":$cnt}"""
+
+                val content = ReplicationStats(tile, cnt, 0, 0, 0, LocalDateTime.now().toString)
                 putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/replication/$tile", "count.json", content)
 
               }
@@ -512,6 +587,9 @@ object GlueApp {
             }
 
             if ((heads > 0 && tails > 0) || (heads == 0 && tails > 0)) {
+              var inserted: Long = 0
+              var deleted: Long = 0
+              var updated: Long = 0
 
               logger.info("Processing delta...")
               val pathTail = s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$currentTile.tail"
@@ -519,29 +597,34 @@ object GlueApp {
                 connectionType = "s3",
                 format = "parquet",
                 options = JsonOptions(s"""{"paths": ["$pathTail"]}""")
-              ).getDynamicFrame().toDF().drop("group").persist(StorageLevel.DISK_ONLY)
+              ).getDynamicFrame().toDF().drop("group").persist(cachingMode)
 
               val pathHead = s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$currentTile.head"
               val dfHead = glueContext.getSourceWithFormat(
                 connectionType = "s3",
                 format = "parquet",
                 options = JsonOptions(s"""{"paths": ["$pathHead"]}""")
-              ).getDynamicFrame().toDF().drop("group").persist(StorageLevel.DISK_ONLY)
+              ).getDynamicFrame().toDF().drop("group").persist(cachingMode)
 
-              val newInsertsDF = dfTail.drop("ts").as("tail").join(dfHead.drop("ts").as("head"), cond, "leftanti").persist(StorageLevel.DISK_ONLY)
-              val newDeletesDF = dfHead.drop("ts").as("head").join(dfTail.drop("ts").as("tail"), cond, "leftanti").persist(StorageLevel.DISK_ONLY)
+              val newInsertsDF = dfTail.drop("ts").as("tail").join(dfHead.drop("ts").as("head"), cond, "leftanti").persist(cachingMode)
+              val newDeletesDF = dfHead.drop("ts").as("head").join(dfTail.drop("ts").as("tail"), cond, "leftanti").persist(cachingMode)
 
               columnTs match {
                 case "None" => {
-                  persistToTarget(newInsertsDF, columns, columnsPos, currentTile, "insert")
+                  if (!newInsertsDF.isEmpty) {
+                    persistToTarget(newInsertsDF, columns, columnsPos, currentTile, "insert")
+                    inserted = newInsertsDF.count()
+                  }
                 }
                 case _ => {
                   val newUpdatesDF = dfTail.as("tail").join(dfHead.as("head"), cond, "inner").
                     filter($"tail.ts" > $"head.ts").
-                    selectExpr(pks.map(x => s"tail.$x"): _*).persist(StorageLevel.DISK_ONLY)
+                    selectExpr(pks.map(x => s"tail.$x"): _*).persist(cachingMode)
                   if (!(newInsertsDF.isEmpty && newUpdatesDF.isEmpty)) {
                     persistToTarget(newInsertsDF, columns, columnsPos, currentTile, "insert")
                     persistToTarget(newUpdatesDF, columns, columnsPos, currentTile, "update")
+                    inserted = newInsertsDF.count()
+                    updated = newUpdatesDF.count()
                   }
                   newUpdatesDF.unpersist()
                 }
@@ -549,6 +632,12 @@ object GlueApp {
 
               if (!newDeletesDF.isEmpty) {
                 persistToTarget(newDeletesDF, columns, columnsPos, currentTile, "delete")
+                deleted = newDeletesDF.count()
+              }
+
+              if (!(updated != 0 && inserted != 0 && deleted != 0)) {
+                val content = ReplicationStats(currentTile, 0, updated, inserted, deleted, LocalDateTime.now().toString)
+                putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/replication/$currentTile", "count.json", content)
               }
 
               newInsertsDF.unpersist()
@@ -574,22 +663,22 @@ object GlueApp {
           sparkSession.read.option("inferSchema", "true").
             table(source).
             selectExpr(pkFinal.map(c => c): _*).
-            persist(StorageLevel.DISK_ONLY)
+            persist(cachingMode)
         case ts if ts != "None" && replicationPointInTime == 0 =>
           sparkSession.read.option("inferSchema", "true").
             table(source).
             selectExpr(pkFinal.map(c => c): _*).
-            persist(StorageLevel.DISK_ONLY)
+            persist(cachingMode)
         case ts if ts != "None" && replicationPointInTime > 0 =>
           sparkSession.read.option("inferSchema", "true").
             table(source).
             selectExpr(pkFinal.map(c => c): _*).
             filter(($"ts" > replicationPointInTime) && ($"ts".isNotNull)).
-            persist(StorageLevel.DISK_ONLY)
+            persist(cachingMode)
       }
 
       val groupedPkDF = primaryKeysDf.withColumn("group", abs(xxhash64(pkFinalWithoutTs.map(c => col(c)): _*)) % totalTiles).
-        repartition(col("group"))
+        repartition(col("group")).persist(cachingMode)
       val tiles = (0 to totalTiles - 1).toList.par
       tiles.foreach(tile => {
         keyspacesConn.withSessionDo {
@@ -647,14 +736,14 @@ object GlueApp {
               val staged = groupedPkDF.where(col("group") === tile).repartition(defaultPartitions, pks.map(c => col(c)): _*)
               staged.write.mode("overwrite").save(s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$tile.head")
               session.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,offload_status,dt_offload,location, ver, load_status, dt_load) VALUES('$srcKeyspaceName','$srcTableName',$tile, 'SUCCESS', toTimestamp(now()), 'tile_$tile.head', 'head','','')")
-              val cnt = staged.count()
-              val content = s"""{"tile":$tile, "primaryKeys":$cnt}"""
+              val content = DiscoveryStats(tile, staged.count(), LocalDateTime.now().toString)
               putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/discovery/$tile", "count.json", content)
             }
           }
             session.close()
         }
       })
+      groupedPkDF.unpersist()
       primaryKeysDf.unpersist()
     }
 

@@ -5,8 +5,9 @@ This migration approach ensures zero downtime, no code compilation, predictable 
 ## Architecture
 This solution offers customers the flexibility to scale the migration workload up and out by deploying multiple Glue
 jobs of CQLReplicator.
-Each glue job (tile) is tasked with handling a specific subset of primary keys (250K per tile) to distribute migration
-workload evenly across Glue data processing units.
+Each glue job (tile) is tasked with handling a specific subset of primary keys (250K per one data processing unit
+G.025X) to distribute migration
+workload evenly across data processing units.
 A single replication glue job (AWS Glue DPU - 0.25X) can push up to 1500 WCUs per second against the target table in
 Amazon Keyspaces. This allows for easy estimation of the final traffic against Amazon Keyspaces.
 
@@ -81,12 +82,15 @@ After running the below command, you should find in the AWS account:
 ## Start migration process
 
 To operate CQLReplicator on AWS Glue, you need to use `--state run` command, followed by a series of parameters. The
-precise
-configuration of these is primarily determined by your unique migration requirements. For instance, these settings may
-vary
-if you choose to replicate TTLs, updates, or offloading objects exceeding 1MB to Amazon S3.
+precise configuration of these is primarily determined by your unique migration requirements. For instance, these
+settings may
+vary if you choose to replicate TTLs, updates, or offloading objects exceeding 1MB to Amazon S3.
 
-Let's run the following command to replicate the workload from the Cassandra cluster to Amazon Keyspaces.
+Estimate the number of tiles, each tile (concurrent glue job) can handle up to 74M primary keys with 299 DPUs (G.025X)
+maximum,
+for example, 8 tiles can handle up to 598M primary keys.
+
+Let's run the following command to replicate the workload from the Cassandra cluster to Amazon Keyspaces:
 
 ```shell
    cqlreplicator --state run --tiles 8 --landing-zone s3://cql-replicator-1234567890-us-west-2 --region us-west-2 \
@@ -146,13 +150,60 @@ In order, to restart failed CQLReplicator jobs, you need to re-run `--state run`
 
 ## Get migration stats
 
-To obtain the number of rows replicated during the back filling phase, run the following command:
+To obtain the number of replicated rows during the back filling phase, run the following command:
 
 ```shell
    cqlreplicator --state stats --landing-zone s3://cql-replicator-1234567890-us-west-2 \ 
                  --src-keyspace ks_test_cql_replicator --src-table test_cql_replicator \
                  --region us-west-2
 ```
+
+To obtain the number of replicated rows after the back filling phase, run the following command:
+
+```shell
+cqlreplicator --state stats --landing-zone s3://cql-replicator-1234567890-us-west-2 \
+--src-keyspace ks_test_cql_replicator --src-table test_cql_replicator \
+--region us-west-2 --replication-stats-enabled
+```
+
+```
+    ___ ___  _     ____            _ _           _
+  / ___/ _ \| |   |  _ \ ___ _ __ | (_) ___ __ _| |_ ___  _ __
+ | |  | | | | |   | |_) / _ \ '_ \| | |/ __/ _` | __/ _ \| '__|
+ | |__| |_| | |___|  _ <  __/ |_) | | | (_| (_| | || (_) | |
+  \____\__\_\_____|_| \_\___| .__/|_|_|\___\__,_|\__\___/|_|
+                            |_|
+·······································································
+:     __          _______   _____           _____                     :
+:    /\ \        / / ____| |  __ \         / ____|                    :
+:   /  \ \  /\  / / (___   | |__) | __ ___| (___   ___ _ ____   _____ :
+:  / /\ \ \/  \/ / \___ \  |  ___/ '__/ _ \\___ \ / _ \ '__\ \ / / _ \:
+: / ____ \  /\  /  ____) | | |   | | | (_) |___) |  __/ |   \ V /  __/:
+:/_/    \_\/  \/  |_____/  |_|   |_|  \___/_____/ \___|_|    \_/ \___|:
+·······································································
+[2024-02-02T16:50:18-05:00] OS: Linux
++------------------------------------------------------------------------+
+| Tile     | Inserts  | Updates  | Deletes  | Timestamp                  |
++------------------------------------------------------------------------+
+| 0        | 4        | 1        | 0        | "2024-02-02T21:50:12.888"  |
++------------------------------------------------------------------------+
+| 1        | 2        | 2        | 1        | "2024-02-02T21:50:25.454"  |
++------------------------------------------------------------------------+
+[2024-02-02T16:50:39-05:00] Discovered rows in ks_test_cql_replicator.test_cql_replicator is 70270
+[2024-02-02T16:50:39-05:00] Replicated rows in ks_test_cql_replicator.test_cql_replicator is 70270
+```
+
+## AWS Glue Monitoring
+
+You can profile and monitor CQLReplicator operations using AWS Glue job profiler. It collects and processes raw data
+from AWS Glue jobs into readable, near real-time metrics stored in Amazon CloudWatch.
+These statistics are retained and aggregated in CloudWatch so that you can access historical information for a better
+perspective on how your application is performing.
+
+In order tp enable the CQLReplicator enhanced monitoring use the `--enhanced-monitoring-enabled` flag with your init
+command.
+
+***You may incur additional charges when you enable job metrics and CloudWatch custom metrics are created***
 
 ## Cost optimization
 
@@ -224,7 +275,7 @@ After the init phase is completed you can run the following command to start the
 
 ## Clean up
 
-The following command will delete the Glue job, connector, the S3 bucket, and Keyspaces'table ledger:
+The following command will delete the Glue job, connector, the S3 bucket, and the ledger table:
 
 ```shell
    cqlreplicator --state cleanup --landing-zone s3://cql-replicator-1234567890-us-west-2 --region "us-west-2"
