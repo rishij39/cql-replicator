@@ -22,11 +22,18 @@ import com.amazonaws.services.timestreamwrite.AmazonTimestreamWrite
 import com.amazonaws.services.timestreamwrite.AmazonTimestreamWriteClientBuilder
 import collection.mutable._
 import com.amazonaws.ClientConfiguration
+import scala.util.{Try, Success, Failure}
 
+class TimestreamException(s: String) extends RuntimeException {
+  println(s)
+}
 
 object GlueApp {
   def main(sysArgs: Array[String]) {
-
+      
+    def getTimestreamConnection(): AmazonTimestreamWrite = {
+      AmazonTimestreamWriteClientBuilder.standard().build()
+    }
     val sparkContext: SparkContext = new SparkContext()
     val glueContext: GlueContext = new GlueContext(sparkContext)
     val sparkSession: SparkSession = glueContext.getSparkSession
@@ -41,8 +48,14 @@ object GlueApp {
     val currentTime = System.currentTimeMillis()
     val recordTime = currentTime - 1 * 50
 
-    val amazonTimestreamWrite:AmazonTimestreamWrite = AmazonTimestreamWriteClientBuilder.standard().withRegion("us-east-1").build()
+    val amazonTimestreamWrite:AmazonTimestreamWrite = getTimestreamConnection()
 
+    Try {
+      val preFlightCheckTimestreamConn = getTimestreamConnection()
+    } match {
+      case Failure(_) => throw new TimestreamException("[Timestream] Connection issue")
+      case Success(_) => logger.info("[Timestream] Preflight check is completed")
+    }
     var dimensions:java.util.List[Dimension] = Buffer().asJava
     dimensions.add(new Dimension().withName("Dim1").withValue("Value1"))
 

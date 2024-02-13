@@ -59,6 +59,14 @@ import redis.clients.jedis.{JedisCluster, HostAndPort}
 
 import net.jpountz.xxhash.XXHashFactory
 
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWrite
+import com.amazonaws.services.timestreamwrite.model.Dimension
+import com.amazonaws.services.timestreamwrite.model.Record
+import com.amazonaws.services.timestreamwrite.model.WriteRecordsRequest
+import com.amazonaws.services.timestreamwrite.model.WriteRecordsResult
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWrite
+import com.amazonaws.services.timestreamwrite.AmazonTimestreamWriteClientBuilder
+
 class LargeObjectException(s: String) extends RuntimeException {
   println(s)
 }
@@ -75,42 +83,24 @@ class TimestreamException(s: String) extends RuntimeException {
   println(s)
 }
 
-case class RedisConfig(pwd: String, usr: String, clusterDnsName: String, clusterPort: Int, sslEnabled: Boolean, maxAttempts: Int, useXXHash64Key: Boolean, connectionTimeout: Int, soTimeout: Int, xxHash64Seed: Long)
+// case class RedisConfig(pwd: String, usr: String, clusterDnsName: String, clusterPort: Int, sslEnabled: Boolean, maxAttempts: Int, useXXHash64Key: Boolean, connectionTimeout: Int, soTimeout: Int, xxHash64Seed: Long)
 
 object GlueApp {
   def main(sysArgs: Array[String]) {
 
-    def readRedisConfigFile(s3Client: com.amazonaws.services.s3.AmazonS3, bucket: String, key: String): RedisConfig = {
-      val s3Object = s3Client.getObject(bucket, key)
-      val src = Source.fromInputStream(s3Object.getObjectContent())
-      val json = src.getLines.mkString
-      src.close()
+    // def readRedisConfigFile(s3Client: com.amazonaws.services.s3.AmazonS3, bucket: String, key: String): RedisConfig = {
+    //   val s3Object = s3Client.getObject(bucket, key)
+    //   val src = Source.fromInputStream(s3Object.getObjectContent())
+    //   val json = src.getLines.mkString
+    //   src.close()
 
-      implicit val formats = DefaultFormats
-      parse(json).extract[RedisConfig]
-    }
+    //   implicit val formats = DefaultFormats
+    //   parse(json).extract[RedisConfig]
+    // }
 
-    def getRedisConnection(redisConfig: RedisConfig, clientName: String): JedisCluster = {
-      val poolConfig = new GenericObjectPoolConfig[Connection]()
-      redisConfig.usr match {
-        case usr if usr.isEmpty => new JedisCluster(new HostAndPort(redisConfig.clusterDnsName, redisConfig.clusterPort),
-          redisConfig.connectionTimeout,
-          redisConfig.soTimeout,
-          redisConfig.maxAttempts,
-          null,
-          null,
-          poolConfig,
-          redisConfig.sslEnabled)
-        case _ => new JedisCluster(new HostAndPort(redisConfig.clusterDnsName, redisConfig.clusterPort),
-          redisConfig.connectionTimeout,
-          redisConfig.soTimeout,
-          redisConfig.maxAttempts,
-          redisConfig.usr,
-          redisConfig.pwd,
-          clientName,
-          poolConfig,
-          redisConfig.sslEnabled)
-      }
+
+    def getTimestreamConnection(): AmazonTimestreamWrite = {
+      AmazonTimestreamWriteClientBuilder.standard().build()
     }
 
     def shuffleDf(df: DataFrame): DataFrame = {
@@ -233,15 +223,14 @@ object GlueApp {
 
     //AmazonS3Client to check if a stop requested issued
     val s3client = new AmazonS3Client()
-    val redisConfig = readRedisConfigFile(s3client, bcktName, "artifacts/RedisConnector.conf")
+    // val redisConfig = readRedisConfigFile(s3client, bcktName, "artifacts/RedisConnector.conf")
     preFlightCheck(cassandraConn, srcKeyspaceName, srcTableName, "source")
     logger.info("[Cassandra] Preflight check is completed")
     Try {
-      val preFlightCheckRedisConn = getRedisConnection(redisConfig, "Preflight check Redis connection")
-      preFlightCheckRedisConn.close()
+      val preFlightCheckTimestreamConn = getTimestreamConnection()
     } match {
-      case Failure(_) => throw new RedisConnectionException("[Redis] Connection issue, please check the RedisConnector.conf and the Glue connector")
-      case Success(_) => logger.info("[Redis] Preflight check is completed")
+      case Failure(_) => throw new TimestreamException("[Timestream] Connection issue")
+      case Success(_) => logger.info("[Timestream] Preflight check is completed")
     }
 
     val selectStmtWithTTL = ttlColumn match {
@@ -334,25 +323,25 @@ object GlueApp {
       compact(render(jsonNew))
     }
 
-    lazy val computeHash = (key: String, factory: net.jpountz.xxhash.StreamingXXHash64) => {
-      redisConfig.useXXHash64Key match {
-        case true => {
-          val data = key.getBytes("UTF-8")
-          factory.reset()
-          factory.update(data, 0, data.length)
-          factory.getValue.toString
-        }
-        case _ => key
-      }
-    }
+    // lazy val computeHash = (key: String, factory: net.jpountz.xxhash.StreamingXXHash64) => {
+    //   redisConfig.useXXHash64Key match {
+    //     case true => {
+    //       val data = key.getBytes("UTF-8")
+    //       factory.reset()
+    //       factory.update(data, 0, data.length)
+    //       factory.getValue.toString
+    //     }
+    //     case _ => key
+    //   }
+    // }
 
     def persistToTarget(df: DataFrame, columns: scala.collection.immutable.Map[String, String],
                         columnsPos: scala.collection.immutable.SortedSet[(String, Int)], tile: Int, op: String): Unit = {
       df.rdd.foreachPartition(
         partition => {
-          lazy val xxHashFactory = XXHashFactory.fastestInstance()
-          lazy val xxHash64Seed = xxHashFactory.newStreamingHash64(redisConfig.xxHash64Seed)
-          lazy val redisCluster = getRedisConnection(redisConfig, s"CQLReplicator$currentTile")
+          // lazy val xxHashFactory = XXHashFactory.fastestInstance()
+          // lazy val xxHash64Seed = xxHashFactory.newStreamingHash64(redisConfig.xxHash64Seed)
+          // lazy val redisCluster = getRedisConnection(redisConfig, s"CQLReplicator$currentTile")
           partition.foreach(
             row => {
               val whereClause = rowToStatement(row, columns, columnsPos)
@@ -366,28 +355,30 @@ object GlueApp {
                     if (!rs.isEmpty) {
                       val jsonRow = rs.get.getString(0).replace("'", "\\\\u0027")
                       val res = convertToKeyValuePair(whereClause, parse(jsonRow))
-                      val key = computeHash(res._1, xxHash64Seed)
+                      // val key = computeHash(res._1, xxHash64Seed)
+                      val key = res._1
                       if (ttlColumn.equals("None")) {
-                        redisCluster.set(key, res._2)
+                        //redisCluster.set(key, res._2)
+                        logger.info("Insert into timestream")
                       } else {
                         val json4sRow = parse(res._2)
                         val jsonValueWithoutTTL = getJsonWithoutTTLColumn(json4sRow)
                         val ttl = getTTLvalue(json4sRow)
-                        redisCluster.set(key, jsonValueWithoutTTL)
-                        redisCluster.expire(key, ttl.toLong)
+                        // redisCluster.set(key, jsonValueWithoutTTL)
+                        // redisCluster.expire(key, ttl.toLong)
                       }
                     }
                   }
-                  if (op == "delete") {
-                    redisCluster.del(computeHash(convertCassandraKeyToGenericKey(whereClause), xxHash64Seed))
-                  }
+                  // if (op == "delete") {
+                  //   redisCluster.del(computeHash(convertCassandraKeyToGenericKey(whereClause), xxHash64Seed))
+                  // }
                 }
                 }
               }
             }
           )
-          redisCluster.close()
-          xxHash64Seed.close()
+          // redisCluster.close()
+          // xxHash64Seed.close()
         }
       )
     }
@@ -431,7 +422,7 @@ object GlueApp {
       whereStmt.toString
     }
 
-    def persistToRedis(df: DataFrame, op: String, tile: Int): Unit = {
+    def persistToTimestream(df: DataFrame, op: String, tile: Int): Unit = {
       // Try !df.rdd.isEmpty
       // Try df.take(1).isEmpty
       if (!df.isEmpty) {
@@ -460,7 +451,7 @@ object GlueApp {
                 val tile = location._2
                 val numPartitions = sourceDf.rdd.getNumPartitions
                 logger.info(s"Number of partitions $numPartitions")
-                persistToRedis(sourceDf, "insert", tile)
+                persistToTimestream(sourceDf, "insert", tile)
                 session.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,ver,load_status,dt_load, offload_status) VALUES('$srcKeyspaceName','$srcTableName',$tile,'head','SUCCESS', toTimestamp(now()), '')")
                 val cnt = sourceDf.count()
                 val content = s"""{"tile":$tile, "primaryKeys":$cnt}"""
@@ -477,8 +468,8 @@ object GlueApp {
               val newDeletesDF = dfHead.as("head").join(dfTail.as("tail"), cond, "leftanti").persist(StorageLevel.MEMORY_AND_DISK_SER)
               columnTs match {
                 case "None" => {
-                  persistToRedis(newInsertsDF, "insert", currentTile)
-                  persistToRedis(newDeletesDF, "delete", currentTile)
+                  persistToTimestream(newInsertsDF, "insert", currentTile)
+                  persistToTimestream(newDeletesDF, "delete", currentTile)
                 }
                 case _ => {
                   val newUpdatesDF = dfTail.as("tail").
@@ -488,9 +479,9 @@ object GlueApp {
                     // [Optimize] selectExpr to select
                     selectExpr(pks.map(x => s"tail.$x"): _*).
                     persist(StorageLevel.MEMORY_AND_DISK_SER)
-                  persistToRedis(newInsertsDF, "insert", currentTile)
-                  persistToRedis(newUpdatesDF, "update", currentTile)
-                  persistToRedis(newDeletesDF, "delete", currentTile)
+                  persistToTimestream(newInsertsDF, "insert", currentTile)
+                  persistToTimestream(newUpdatesDF, "update", currentTile)
+                  persistToTimestream(newDeletesDF, "delete", currentTile)
                   newUpdatesDF.unpersist()
                 }
               }
